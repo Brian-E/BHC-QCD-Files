@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import  math
 from dataclasses import asdict
 from typing import Any, Dict, Optional
 
@@ -92,48 +93,84 @@ def archetype(channel: str, kerr_ok: bool) -> str:
 
 
 def z_acc_pred_from_bh_inputs(
+    *,
     chi: float,
-    n: Optional[int],
     r0: Optional[float],
+    n: Optional[int],
     eta: float,
     canon: Canon,
 ) -> Optional[float]:
     """
     Compute z_acc_pred if possible.
 
+    Option 2 (locked):
+      - --chi is interpreted as the BH spin at birth for the specified case.
+      - Kerr viability depends ONLY on chi.
+      - If n is provided, it weakens the effective vacuum amplitude via
+        r(n) = r0 * eta^n.
+      - Spin is NOT recomputed internally from chi0/rho.
+
     Rules:
       1) If Kerr gate fails (chi < chi_min): return None (no acceleration).
       2) If r0 is not provided: return None (we refuse to invent a normalization).
-      3) If n is provided: use inherited chi_n(n) for gating, and apply r(n)=r0*eta^n*g(chi_n).
-         Otherwise: use r=r0*g(chi).
+      3) If n is provided: apply r(n)=r0*eta^n.
+         Otherwise: use r=r0.
     """
+    # Kerr viability gate
     if not kerr_viable(chi, canon):
         return None
 
-    if r0 is None:
-        # Acceleration may be possible, but we will not output a numeric onset without amplitude.
+    # Require a vacuum-to-matter normalization
+    if r0 is None or r0 <= 0:
         return None
 
-    if r0 <= 0:
-        return None
-
+    # No ladder position given
     if n is None:
-        r = r0  # Kerr gate already satisfied by chi
-        return z_acc_from_lambda_ratio(r)
+        return z_acc_from_lambda_ratio(r0)
 
+    # Ladder position given
     if n < 0:
         raise ValueError("n must be >= 0 (n=0 is Base-1)")
-
-    # Use inherited spin at generation n for consistency and gating
-    chi_inherited = chi_n(n, canon)
-    if not kerr_viable(chi_inherited, canon):
-        return None
 
     if not (0.0 < eta <= 1.0):
         raise ValueError("eta must be in (0,1]")
 
     r_n = r0 * (eta ** n)
     return z_acc_from_lambda_ratio(r_n)
+
+import math
+
+def infer_n_range_from_zacc(z_obs: float, z_tol: float, r0: float, eta: float, n_max: int):
+    # Convert z -> required ratio r_req = ((1+z)^3)/2
+    def r_req(z):
+        return ((1.0 + z) ** 3) / 2.0
+
+    if not (0.0 < eta < 1.0):
+        raise ValueError("infer-n requires eta in (0,1).")
+    if r0 <= 0:
+        raise ValueError("infer-n requires lambda-ratio (r0) > 0.")
+
+    r_lo = r_req(max(0.0, z_obs - z_tol))
+    r_hi = r_req(z_obs + z_tol)
+
+    # r(n) = r0 * eta^n must fall within [r_lo, r_hi]
+    # Solve for n bounds:
+    # eta^n >= r_lo/r0 and eta^n <= r_hi/r0 (note eta<1)
+    # Use logs carefully; clamp to feasible range
+    ln_eta = math.log(eta)
+
+    # If the target ratios exceed r0 (i.e., require eta^n > 1), then only very small n could work (often none)
+    # We'll compute raw bounds and then scan integer n for robustness.
+    candidates = []
+    for n in range(0, n_max + 1):
+        r_n = r0 * (eta ** n)
+        z_n = (2.0 * r_n) ** (1.0 / 3.0) - 1.0
+        if abs(z_n - z_obs) <= z_tol:
+            candidates.append(n)
+
+    if not candidates:
+        return None, None, []
+    return min(candidates), max(candidates), candidates
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -186,6 +223,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=1.0,
         help="Per-generation weakening factor for r(n)=r0*eta^n (used when --n is provided).",
     )
+    opt.add_argument("--infer-n", action="store_true",
+               help="Infer a compatible range of n from z_acc_obs/tol given --lambda-ratio and --eta.")
+    opt.add_argument("--n-max", type=int, default=30,
+               help="Max n to consider when using --infer-n (default: 30).")
 
     # -----------------------------
     # Ladder / model parameters
@@ -235,6 +276,18 @@ def main() -> None:
 
     zacc_pred = z_acc_pred_from_bh_inputs(chi=chi, n=n, r0=r0, eta=eta, canon=canon)
     relic_expect = relic_band_from_zacc(zacc_pred)
+
+    if args.infer_n:
+        if args.zacc is None or args.zacc_tol is None:
+            raise ValueError("--infer-n requires --zacc and --zacc-tol")
+        if args.lambda_ratio is None:
+            raise ValueError("--infer-n requires --lambda-ratio (r0)")
+        nmin, nmax, ns = infer_n_range_from_zacc(args.zacc, args.zacc_tol, args.lambda_ratio, args.eta, args.n_max)
+        if ns:
+            print(f"\nInferred n range matching z_acc={args.zacc:.3f}±{args.zacc_tol:.3f}: n={nmin}..{nmax}")
+            print(f"Representative n values: {ns[:10]}{' ...' if len(ns)>10 else ''}")
+        else:
+            print(f"\nNo n in [0,{args.n_max}] matches z_acc={args.zacc:.3f}±{args.zacc_tol:.3f} for r0={args.lambda_ratio} eta={args.eta}")
 
     # Parity compatibility: Pi=1 requires Kerr viability
     Pi1_compatible = bool(kerr_ok)
